@@ -96,6 +96,8 @@ class _RecorderScreenState extends State<RecorderScreen> {
             ),
             path: path,
           );
+          
+          print("Recording started");
 
           setState(() {
             _isRecording = true;
