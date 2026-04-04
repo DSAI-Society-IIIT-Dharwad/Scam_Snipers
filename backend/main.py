@@ -36,7 +36,7 @@ async def upload_audio(file: UploadFile = File(...)):
     try:
         with open(file_location, "rb") as f:
             files = {
-                "file": ("audio.m4a", f, "audio/m4a")
+                "file": ("audio.m4a", f, "audio/x-m4a")
             }
             
             response = requests.post(

@@ -62,10 +62,13 @@ class _RecorderScreenState extends State<RecorderScreen> {
       if (_isRecording) {
         // Stop recording
         final path = await _audioRecorder.stop();
+        print("Recording stopped");
+        print("File path: $path");
+        
         setState(() {
           _isRecording = false;
           _isProcessing = true;
-          _statusText = "Processing...";
+          _statusText = "Uploading...";
           _transcriptionText = null;
         });
 
@@ -122,7 +125,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
     final file = File(filePath);
     if (!await file.exists() || await file.length() == 0) {
       setState(() {
-        _statusText = "Warning: Empty audio";
+        _statusText = "File not found";
         _isProcessing = false;
       });
       return;
@@ -133,15 +136,17 @@ class _RecorderScreenState extends State<RecorderScreen> {
     });
 
     try {
-      print("Sending request...");
-      var request = http.MultipartRequest('POST', Uri.parse(backendUrl));
+      print("Sending request to backend...");
+      var uri = Uri.parse(backendUrl);
+      var request = http.MultipartRequest('POST', uri);
       request.files.add(await http.MultipartFile.fromPath('file', filePath));
 
       // Use a timeout to handle network failure gracefully
       var streamedResponse = await request.send().timeout(const Duration(seconds: 30));
       var response = await http.Response.fromStream(streamedResponse);
 
-      print("Response received: ${response.statusCode} - ${response.body}");
+      print("Response status: ${response.statusCode}");
+      print("Response body: ${response.body}");
 
       setState(() {
         _statusText = "Processing...";
@@ -152,32 +157,25 @@ class _RecorderScreenState extends State<RecorderScreen> {
         
         setState(() {
           _transcriptionText = responseData['text'];
-          if (_transcriptionText != null && _transcriptionText!.startsWith("Error:")) {
-            _statusText = "Transcription failed";
-          } else {
-            _statusText = "Done";
-          }
+          _statusText = "Done";
         });
       } else {
         setState(() {
-          _statusText = "Transcription failed";
+          _statusText = "Processing error";
         });
-        debugPrint(response.body);
       }
     } on TimeoutException {
       setState(() {
-        _statusText = "Server not reachable";
+        _statusText = "Network Error";
       });
-      debugPrint("Request timed out");
     } catch (e) {
       setState(() {
         _statusText = "Network Error";
       });
-      debugPrint("Error connecting to backend: $e");
     } finally {
       setState(() {
         _isProcessing = false;
-        if (_statusText != "Done" && !_statusText.contains("failed") && _statusText != "Network Error" && _statusText != "Server not reachable" && _statusText != "Warning: Empty audio") {
+        if (_statusText != "Done" && _statusText != "Network Error" && _statusText != "Processing error" && _statusText != "File not found") {
            _statusText = "Tap to start recording";
         }
       });
