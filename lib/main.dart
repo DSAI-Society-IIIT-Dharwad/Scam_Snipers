@@ -41,7 +41,9 @@ class _RecorderScreenState extends State<RecorderScreen> {
   bool _isRecording = false;
   bool _isProcessing = false;
   String _statusText = "Tap to start recording";
-  String? _transcriptionText;
+  
+  final List<Map<String, dynamic>> _transcriptions = [];
+  Timer? _chunkTimer;
 
   @override
   void initState() {
@@ -51,25 +53,37 @@ class _RecorderScreenState extends State<RecorderScreen> {
 
   @override
   void dispose() {
+    _chunkTimer?.cancel();
     _audioRecorder.dispose();
     super.dispose();
   }
 
-  Future<void> _toggleRecording() async {
-    if (_isProcessing) return; // Prevent action while processing
+  Future<void> _startRecordingChunk() async {
+    final dir = await getApplicationDocumentsDirectory();
+    final path = '${dir.path}/talk_tally_${DateTime.now().millisecondsSinceEpoch}.m4a';
+    await _audioRecorder.start(
+      const RecordConfig(
+        encoder: AudioEncoder.aacLc,
+        sampleRate: 44100,
+        bitRate: 128000,
+        numChannels: 1, // Mono channel
+      ),
+      path: path,
+    );
+  }
 
+  Future<void> _toggleRecording() async {
     try {
       if (_isRecording) {
         // Stop recording
+        _chunkTimer?.cancel();
         final path = await _audioRecorder.stop();
-        print("Recording stopped");
-        print("File path: $path");
+        print("Recording stopped manually");
         
         setState(() {
           _isRecording = false;
           _isProcessing = true;
-          _statusText = "Uploading...";
-          _transcriptionText = null;
+          _statusText = "Stopping and processing last chunk...";
         });
 
         if (path != null) {
@@ -81,28 +95,37 @@ class _RecorderScreenState extends State<RecorderScreen> {
           });
         }
       } else {
+        if (_isProcessing) return; // Wait until ready
+        
         // Request permissions
         if (await _requestMicrophonePermission()) {
-          final dir = await getApplicationDocumentsDirectory();
-          final path = '${dir.path}/talk_tally_${DateTime.now().millisecondsSinceEpoch}.m4a';
-
-          // Start recording
-          await _audioRecorder.start(
-            const RecordConfig(
-              encoder: AudioEncoder.aacLc,
-              sampleRate: 44100,
-              bitRate: 128000,
-              numChannels: 1, // Mono channel
-            ),
-            path: path,
-          );
-          
-          print("Recording started");
-
+          // Clear history on new sessions
           setState(() {
             _isRecording = true;
-            _statusText = "Recording...";
-            _transcriptionText = null;
+            _statusText = "Recording continuously...";
+            _transcriptions.clear();
+          });
+
+          // Start initial segment
+          await _startRecordingChunk();
+          print("Recording started");
+
+          // Start continuous chunk loop (8 second chunks)
+          _chunkTimer = Timer.periodic(const Duration(seconds: 8), (timer) async {
+             if (!_isRecording) {
+                 timer.cancel();
+                 return;
+             }
+             final path = await _audioRecorder.stop();
+             print("Chunk stopped. Restarting...");
+             
+             // Immediately start next segment seamlessly
+             await _startRecordingChunk(); 
+             
+             if (path != null) {
+               // Push chunk to background api sync silently
+               _uploadAudioAndTranscribe(path);
+             }
           });
         }
       }
@@ -126,61 +149,71 @@ class _RecorderScreenState extends State<RecorderScreen> {
     // 2. Validate audio file
     final file = File(filePath);
     if (!await file.exists() || await file.length() == 0) {
-      setState(() {
-        _statusText = "File not found";
-        _isProcessing = false;
-      });
+      if (!_isRecording) {
+          setState(() {
+            _statusText = "File not found";
+            _isProcessing = false;
+          });
+      }
       return;
     }
 
-    setState(() {
-      _statusText = "Uploading...";
-    });
-
     try {
-      print("Sending request to backend...");
+      print("Sending chunk to backend...");
       var uri = Uri.parse(backendUrl);
       var request = http.MultipartRequest('POST', uri);
+      
+      // 3. Attach standard fields
+      final timestampStr = DateTime.now().toLocal().toString().split('.')[0];
+      request.fields['timestamp'] = timestampStr;
       request.files.add(await http.MultipartFile.fromPath('file', filePath));
 
-      // Use a timeout to handle network failure gracefully
       var streamedResponse = await request.send().timeout(const Duration(seconds: 30));
       var response = await http.Response.fromStream(streamedResponse);
 
       print("Response status: ${response.statusCode}");
-      print("Response body: ${response.body}");
-
-      setState(() {
-        _statusText = "Processing...";
-      });
-
+      
       if (response.statusCode == 200) {
         final Map<String, dynamic> responseData = json.decode(response.body);
         
         setState(() {
-          _transcriptionText = responseData['text'];
-          _statusText = "Done";
+          // Push new transcription to top of list
+          _transcriptions.insert(0, {
+             "text": responseData['text'] ?? "Unable to parse text",
+             "language": responseData['language'] ?? "Unknown",
+             "timestamp": responseData['timestamp'] ?? timestampStr,
+          });
+          
+          if (!_isRecording) _statusText = "Done";
         });
       } else {
-        setState(() {
-          _statusText = "Processing error";
-        });
+        if (!_isRecording) {
+          setState(() {
+            _statusText = "Processing error";
+          });
+        }
       }
     } on TimeoutException {
-      setState(() {
-        _statusText = "Network Error";
-      });
+      if (!_isRecording) {
+        setState(() {
+            _statusText = "Network Error";
+        });
+      }
     } catch (e) {
-      setState(() {
-        _statusText = "Network Error";
-      });
+      if (!_isRecording) {
+        setState(() {
+            _statusText = "Network Error";
+        });
+      }
     } finally {
-      setState(() {
-        _isProcessing = false;
-        if (_statusText != "Done" && _statusText != "Network Error" && _statusText != "Processing error" && _statusText != "File not found") {
-           _statusText = "Tap to start recording";
-        }
-      });
+      if (!_isRecording) {
+          setState(() {
+            _isProcessing = false;
+            if (_statusText != "Done" && _statusText != "Network Error" && _statusText != "Processing error" && _statusText != "File not found") {
+               _statusText = "Tap to start recording";
+            }
+          });
+      }
     }
   }
 
@@ -213,7 +246,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               const Text(
-                'Financial Conversation Recorder',
+                'Continuous Financial Recorder',
                 style: TextStyle(
                   fontSize: 18,
                   fontWeight: FontWeight.w500,
@@ -262,42 +295,70 @@ class _RecorderScreenState extends State<RecorderScreen> {
                 ),
               ),
               const SizedBox(height: 32),
-              if (_transcriptionText != null)
-                Container(
-                  padding: const EdgeInsets.all(16),
-                  decoration: BoxDecoration(
-                    color: Colors.white,
-                    borderRadius: BorderRadius.circular(12),
-                    boxShadow: [
-                      BoxShadow(
-                        color: Colors.black.withOpacity(0.05),
-                        blurRadius: 10,
-                        offset: const Offset(0, 4),
+              if (_transcriptions.isNotEmpty)
+                ListView.builder(
+                  shrinkWrap: true,
+                  physics: const NeverScrollableScrollPhysics(),
+                  itemCount: _transcriptions.length,
+                  itemBuilder: (context, index) {
+                    final item = _transcriptions[index];
+                    return Container(
+                      margin: const EdgeInsets.only(bottom: 12),
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: Colors.white,
+                        borderRadius: BorderRadius.circular(12),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withOpacity(0.05),
+                            blurRadius: 10,
+                            offset: const Offset(0, 4),
+                          ),
+                        ],
                       ),
-                    ],
-                  ),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      const Text(
-                        "Transcription:",
-                        style: TextStyle(
-                          fontSize: 14,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.blueGrey,
-                        ),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          Row(
+                            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                            children: [
+                              Text(
+                                item['timestamp'] ?? '',
+                                style: const TextStyle(
+                                  fontSize: 12,
+                                  color: Colors.grey,
+                                ),
+                              ),
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                decoration: BoxDecoration(
+                                  color: Colors.blue.withOpacity(0.1),
+                                  borderRadius: BorderRadius.circular(4),
+                                ),
+                                child: Text(
+                                  item['language'] ?? 'Unknown',
+                                  style: const TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.bold,
+                                    color: Colors.blue,
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          Text(
+                            item['text'] ?? '',
+                            style: const TextStyle(
+                              fontSize: 16,
+                              height: 1.5,
+                              color: Colors.black87,
+                            ),
+                          ),
+                        ],
                       ),
-                      const SizedBox(height: 8),
-                      Text(
-                        _transcriptionText!,
-                        style: const TextStyle(
-                          fontSize: 16,
-                          height: 1.5,
-                          color: Colors.black87,
-                        ),
-                      ),
-                    ],
-                  ),
+                    );
+                  },
                 ),
             ],
           ),
