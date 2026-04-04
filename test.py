@@ -8,6 +8,7 @@ tests = [
     "SIP 5000 monthly karna hai 10% return",
     "12 months tenure 9.5% interest pe",
     "car insurance renew karna hai"
+    "ಪ್ರತಿ ತಿಂಗಳು 5000 SIP 12 ಶೇಕಡಾ ಲಾಭ ಭರವಸೆ"
 ]
 
 print("🧪 TESTING SAKSHI FINANCIAL NLP API\n")
