@@ -1,3 +1,7 @@
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI, UploadFile, File, Form
 import requests
 import shutil
@@ -26,18 +30,133 @@ LANGUAGE_MAP = {
 }
 
 import json
+import psycopg2
 
-GEMINI_API_KEY = "AIzaSyDSJQwUtgFBPy9DrLZXEhj2wxJpr9t6l4c"
+try:
+    conn = psycopg2.connect(
+        dbname="finance_db",
+        user="postgres",
+        password="YOUR_PASSWORD",
+        host="localhost",
+        port="5432"
+    )
+    cur = conn.cursor()
+    
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS financial_insights (
+        id SERIAL PRIMARY KEY,
+        text TEXT,
+        amount FLOAT,
+        currency TEXT,
+        person TEXT,
+        intent TEXT,
+        emotion TEXT,
+        confidence FLOAT,
+        summary TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """)
+    conn.commit()
+except Exception as e:
+    print("Database connection error:", e)
+    conn = None
+    cur = None
+
+def generate_summary(data):
+    if not data or data.get("text") is None:
+        return None
+
+    amount = data.get("amount")
+    person = data.get("person")
+    intent = data.get("intent")
+    emotion = data.get("emotion")
+
+    parts = []
+
+    if intent == "transfer":
+        parts.append(f"Transfer ₹{amount} to {person}")
+    elif intent == "investment":
+        parts.append(f"Investment of ₹{amount}")
+    elif intent == "loan":
+        parts.append(f"Loan discussion of ₹{amount}")
+    else:
+        parts.append("Financial activity detected")
+
+    if emotion == "stress":
+        parts.append("user is stressed")
+    elif emotion == "positive":
+        parts.append("user feels confident")
+    else:
+        parts.append("neutral sentiment")
+
+    return ", ".join(parts)
+
+def store_data(data, summary):
+    if cur is None:
+        return
+    cur.execute("""
+        INSERT INTO financial_insights 
+        (text, amount, currency, person, intent, emotion, confidence, summary)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    """, (
+        data.get("text"),
+        data.get("amount"),
+        data.get("currency"),
+        data.get("person"),
+        data.get("intent"),
+        data.get("emotion"),
+        data.get("confidence"),
+        summary
+    ))
+    conn.commit()
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+if not GEMINI_API_KEY:
+    raise ValueError("GEMINI_API_KEY not found. Please set it in environment variables.")
+
+conversation_buffer = []
+
+def build_context(new_text):
+    global conversation_buffer
+
+    if new_text:
+        conversation_buffer.append(new_text)
+
+    # Keep only last 3 chunks
+    if len(conversation_buffer) > 3:
+        conversation_buffer.pop(0)
+
+    # Combine into context
+    context = " ".join(conversation_buffer)
+    return context
+
+def clean_gemini_response(text):
+    if not text:
+        return None
+
+    text = text.strip()
+
+    # Remove markdown wrappers
+    text = re.sub(r"```json", "", text)
+    text = re.sub(r"```", "", text)
+    text = text.strip()
+
+    # Handle null safely
+    if text.lower() == "null":
+        return None
+
+    try:
+        return json.loads(text)
+    except Exception as e:
+        print("JSON parsing error:", e)
+        return None
 
 def process_with_gemini(text: str):
     empty_result = {
-        "text": None,
-        "amount": None,
-        "currency": "INR",
-        "person": None,
-        "intent": None,
-        "emotion": None,
-        "confidence": 0
+        "data": None,
+        "summary": None,
+        "message": "No financial insight detected"
     }
     
     if not text or "Could not parse" in text:
@@ -47,11 +166,12 @@ def process_with_gemini(text: str):
         "Content-Type": "application/json"
     }
     
+    context_text = build_context(text)
+    
     prompt = f"""
 Extract ONLY financial decisions from the speech.
 
-If no financial content:
-return null JSON.
+Extract financial information if present. If weak financial context exists, still extract best possible interpretation.
 
 Otherwise:
 - Convert to English
@@ -74,7 +194,7 @@ Return JSON ONLY:
 }}
 
 Speech:
-{text}
+{context_text}
 """
     
     payload = {
@@ -88,7 +208,7 @@ Speech:
     }
     
     try:
-        url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-pro:generateContent?key={GEMINI_API_KEY}"
+        url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
         response = requests.post(url, headers=headers, json=payload, timeout=15)
         result = response.json()
         
@@ -101,31 +221,16 @@ Speech:
         gemini_text = result["candidates"][0]["content"]["parts"][0]["text"]
         print("Gemini Raw Response:", gemini_text)
 
-        import json
+        clean_output = clean_gemini_response(gemini_text)
         
-        # Clean potential markdown wrapping automatically added by LLMs
-        clean_text = gemini_text.strip()
-        if clean_text.startswith("```json"):
-            clean_text = clean_text[7:]
-        if clean_text.startswith("```"):
-            clean_text = clean_text[3:]
-        if clean_text.endswith("```"):
-            clean_text = clean_text[:-3]
+        if clean_output is None:
+            return empty_result
             
-        structured_data = json.loads(clean_text.strip())
-        return structured_data
+        return clean_output
 
     except Exception as e:
         print("Gemini parsing error:", str(e))
-        return {
-            "text": text,
-            "amount": None,
-            "currency": "INR",
-            "person": None,
-            "intent": None,
-            "emotion": None,
-            "confidence": 0
-        }
+        return empty_result
 
 def detect_language_label(text: str, base_lang_code: str) -> str:
     # Rule: If english characters exist alongside local indic fonts, label code-mixed
@@ -241,9 +346,13 @@ async def upload_audio(file: UploadFile = File(...), timestamp: str = Form("Unkn
             print("Raw STT:", text)
             print("Gemini Output:", gemini_result)
             
-            # Since the user specifically requested to return the Gemini Output
-            # We return it directly, which the Flutter application expects and gracefully handles its missing data fallbacks:
-            return gemini_result
+            summary = generate_summary(gemini_result)
+            store_data(gemini_result, summary)
+            
+            return {
+                "data": gemini_result,
+                "summary": summary
+            }
             
     except Exception as e:
         print("Error processing audio:", str(e))
@@ -252,3 +361,45 @@ async def upload_audio(file: UploadFile = File(...), timestamp: str = Form("Unkn
             "language": "Error",
             "timestamp": timestamp
         }
+
+@app.get("/summary")
+def get_final_summary():
+    if cur is None:
+        return {"final_summary": "Database unavailable"}
+    cur.execute("SELECT summary FROM financial_insights")
+    rows = cur.fetchall()
+    summaries = [row[0] for row in rows if row[0]]
+    return {"final_summary": " | ".join(summaries)}
+
+@app.get("/insights")
+def get_insights():
+    if cur is None:
+        return {"insights": []}
+    
+    try:
+        cur.execute("""
+            SELECT id, text, amount, person, intent, emotion, summary, created_at
+            FROM financial_insights
+            ORDER BY created_at DESC
+            LIMIT 20
+        """)
+        
+        rows = cur.fetchall()
+
+        results = []
+        for row in rows:
+            results.append({
+                "id": row[0],
+                "text": row[1],
+                "amount": row[2],
+                "person": row[3],
+                "intent": row[4],
+                "emotion": row[5],
+                "summary": row[6],
+                "created_at": str(row[7])
+            })
+
+        return {"insights": results}
+    except Exception as e:
+        print("Error fetching insights:", e)
+        return {"insights": []}

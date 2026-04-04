@@ -295,6 +295,24 @@ class _RecorderScreenState extends State<RecorderScreen> {
                 ),
               ),
               const SizedBox(height: 32),
+              ElevatedButton.icon(
+                onPressed: () {
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(builder: (context) => const InsightsPage()),
+                  );
+                },
+                icon: const Icon(Icons.insights),
+                label: const Text("View Insights"),
+                style: ElevatedButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                  backgroundColor: Colors.white,
+                  foregroundColor: Colors.blueAccent,
+                  elevation: 2,
+                ),
+              ),
+              const SizedBox(height: 24),
               if (_transcriptions.isNotEmpty)
                 ListView.builder(
                   shrinkWrap: true,
@@ -302,6 +320,13 @@ class _RecorderScreenState extends State<RecorderScreen> {
                   itemCount: _transcriptions.length,
                   itemBuilder: (context, index) {
                     final item = _transcriptions[index];
+                    
+                    // We extract safe fallbacks out of the nested dictionary response data natively:
+                    String displayText = item['text'] ?? '';
+                    if (item.containsKey('data') && item['data'] is Map && item['data']['text'] != null) {
+                        displayText = item['data']['text'];
+                    }
+                    
                     return Container(
                       margin: const EdgeInsets.only(bottom: 12),
                       padding: const EdgeInsets.all(16),
@@ -336,7 +361,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
                                   borderRadius: BorderRadius.circular(4),
                                 ),
                                 child: Text(
-                                  item['language'] ?? 'Unknown',
+                                  item['language'] ?? 'Processed',
                                   style: const TextStyle(
                                     fontSize: 12,
                                     fontWeight: FontWeight.bold,
@@ -348,7 +373,7 @@ class _RecorderScreenState extends State<RecorderScreen> {
                           ),
                           const SizedBox(height: 8),
                           Text(
-                            item['text'] ?? '',
+                            displayText,
                             style: const TextStyle(
                               fontSize: 16,
                               height: 1.5,
@@ -364,6 +389,146 @@ class _RecorderScreenState extends State<RecorderScreen> {
           ),
         ),
       ),
+    );
+  }
+}
+
+class InsightsPage extends StatefulWidget {
+  const InsightsPage({Key? key}) : super(key: key);
+
+  @override
+  State<InsightsPage> createState() => _InsightsPageState();
+}
+
+class _InsightsPageState extends State<InsightsPage> {
+  List<dynamic> _insights = [];
+  bool _isLoading = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _fetchInsights();
+  }
+
+  Future<void> _fetchInsights() async {
+    setState(() {
+      _isLoading = true;
+    });
+    try {
+      final response = await http.get(Uri.parse('http://10.0.3.49:8000/insights'));
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        setState(() {
+          _insights = data['insights'] ?? [];
+          _isLoading = false;
+        });
+      } else {
+        setState(() {
+          _isLoading = false;
+        });
+      }
+    } catch (e) {
+      print("Error fetching insights: \$e");
+      setState(() {
+        _isLoading = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFFF5F7FA),
+      appBar: AppBar(
+        title: const Text('Financial Insights', style: TextStyle(fontWeight: FontWeight.bold)),
+        backgroundColor: Colors.white,
+        foregroundColor: Colors.black87,
+        elevation: 0,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: _fetchInsights,
+          )
+        ],
+      ),
+      body: _isLoading
+          ? const Center(child: CircularProgressIndicator())
+          : _insights.isEmpty
+              ? const Center(child: Text("No insights available yet."))
+              : RefreshIndicator(
+                  onRefresh: _fetchInsights,
+                  child: ListView.builder(
+                    padding: const EdgeInsets.all(16.0),
+                    itemCount: _insights.length,
+                    itemBuilder: (context, index) {
+                      final item = _insights[index];
+                      final amount = item['amount'];
+                      final person = item['person'] ?? 'Unknown';
+                      final intent = item['intent'] ?? 'Unknown';
+                      final emotion = item['emotion'] ?? 'neutral';
+                      
+                      String amountText = amount != null ? '₹\$amount' : '₹--';
+                      String heading = '💰 \$amountText → \$person';
+                      
+                      String intentEmoji = '📌';
+                      if (intent == 'transfer') intentEmoji = '💸';
+                      if (intent == 'investment') intentEmoji = '📈';
+                      if (intent == 'loan') intentEmoji = '🏦';
+                      
+                      String emotionEmoji = '😐';
+                      if (emotion == 'stress') emotionEmoji = '😰';
+                      if (emotion == 'positive') emotionEmoji = '😊';
+
+                      return Card(
+                        margin: const EdgeInsets.only(bottom: 16.0),
+                        elevation: 2,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                        child: Padding(
+                          padding: const EdgeInsets.all(16.0),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Row(
+                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                children: [
+                                  Expanded(
+                                    child: Text(
+                                      heading,
+                                      style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.black87),
+                                      overflow: TextOverflow.ellipsis,
+                                    ),
+                                  ),
+                                  Text(
+                                    item['created_at']?.split(' ')[0] ?? '',
+                                    style: const TextStyle(fontSize: 12, color: Colors.grey),
+                                  ),
+                                ],
+                              ),
+                              const SizedBox(height: 12),
+                              Row(
+                                children: [
+                                  Text('\$intentEmoji \${intent.toString().toUpperCase()}', style: const TextStyle(color: Colors.blueGrey, fontWeight: FontWeight.w600)),
+                                  const SizedBox(width: 16),
+                                  Text('\$emotionEmoji \${emotion.toString().toUpperCase()}', style: const TextStyle(color: Colors.orange, fontWeight: FontWeight.w600)),
+                                ],
+                              ),
+                              const Divider(height: 24, thickness: 1),
+                              const Text(
+                                '📝 Summary:',
+                                style: TextStyle(fontWeight: FontWeight.bold, color: Colors.black54),
+                              ),
+                              const SizedBox(height: 4),
+                              Text(
+                                item['summary'] ?? item['text'] ?? 'No summary available',
+                                style: const TextStyle(fontSize: 15, height: 1.4),
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+                ),
     );
   }
 }
