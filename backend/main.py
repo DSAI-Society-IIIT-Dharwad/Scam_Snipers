@@ -36,11 +36,12 @@ try:
     conn = psycopg2.connect(
         dbname="finance_db",
         user="postgres",
-        password="YOUR_PASSWORD",
+        password="postgres123",   # replace if different
         host="localhost",
-        port="5432"
+        port="5433"
     )
     cur = conn.cursor()
+    print("✅ PostgreSQL Connected")
     
     cur.execute("""
     CREATE TABLE IF NOT EXISTS financial_insights (
@@ -58,7 +59,7 @@ try:
     """)
     conn.commit()
 except Exception as e:
-    print("Database connection error:", e)
+    print("❌ Database connection error:", e)
     conn = None
     cur = None
 
@@ -93,22 +94,29 @@ def generate_summary(data):
 
 def store_data(data, summary):
     if cur is None:
+        print("⚠️ DB not connected, skipping insert")
         return
-    cur.execute("""
-        INSERT INTO financial_insights 
-        (text, amount, currency, person, intent, emotion, confidence, summary)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-    """, (
-        data.get("text"),
-        data.get("amount"),
-        data.get("currency"),
-        data.get("person"),
-        data.get("intent"),
-        data.get("emotion"),
-        data.get("confidence"),
-        summary
-    ))
-    conn.commit()
+
+    try:
+        cur.execute("""
+            INSERT INTO financial_insights 
+            (text, amount, currency, person, intent, emotion, confidence, summary)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            data.get("text"),
+            data.get("amount"),
+            data.get("currency"),
+            data.get("person"),
+            data.get("intent"),
+            data.get("emotion"),
+            data.get("confidence"),
+            summary
+        ))
+        conn.commit()
+        print("✅ Data stored in PostgreSQL")
+
+    except Exception as e:
+        print("❌ Insert error:", e)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
@@ -153,35 +161,51 @@ def clean_gemini_response(text):
         return None
 
 def process_with_gemini(text: str):
-    empty_result = {
-        "data": None,
-        "summary": None,
-        "message": "No financial insight detected"
-    }
-    
-    if not text or "Could not parse" in text:
-        return empty_result
+    global last_gemini_text
+
+    if not text or text.strip() == "":
+        return None
+
+    financial_keywords = [
+        # English
+        "money", "rupees", "₹", "loan", "emi", "pay", "transfer", "send",
+        "investment", "mutual fund", "expense", "salary", "debt", "bill",
+        "budget", "saving", "saving", "bank", "interest", "finance", "cost",
+        "afford", "expensive", "cheap", "price", "fee", "tax", "income",
+        "spend", "spent", "lend", "borrow", "credit", "debit", "due",
+        # Hindi / Indic
+        "ईएएमआई", "ईएमआई", "पैसा", "पैसे", "रुपए", "लोन",
+        "खर्च", "निवेश", "बचत", "कर्ज", "उधार", "बिल",
+        "बैंक", "वेतन", "टैक्स"
+    ]
+
+    if not any(word in text.lower() for word in financial_keywords):
+        return None
         
     headers = {
         "Content-Type": "application/json"
     }
     
-    context_text = build_context(text)
-    
     prompt = f"""
-Extract ONLY financial decisions from the speech.
+Extract financial information from the speech.
 
-Extract financial information if present. If weak financial context exists, still extract best possible interpretation.
+IMPORTANT:
+- Keep meaning EXACT
+- Do NOT add new information
+- Do NOT rephrase heavily
+- Only clean and normalize
 
-Otherwise:
-- Convert to English
-- Extract amount (number only)
-- Extract person name
-- Classify intent (transfer, loan, investment, expense)
+If financial signal exists:
+- Convert to simple English
+- Extract amount (number only if present)
+- Extract person (if mentioned)
+- Classify intent (transfer, loan, expense, investment, discussion)
 - Detect emotion (stress, neutral, positive)
-- Do NOT hallucinate
 
-Return JSON ONLY:
+If no financial content:
+return null
+
+Return JSON ONLY (no markdown, no explanation):
 
 {{
   "text": "...",
@@ -194,7 +218,7 @@ Return JSON ONLY:
 }}
 
 Speech:
-{context_text}
+{text}
 """
     
     payload = {
@@ -210,27 +234,53 @@ Speech:
     try:
         url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
         response = requests.post(url, headers=headers, json=payload, timeout=15)
+        
+        if response.status_code == 429:
+            import time
+            print("⚠️ Gemini 429 Quota Exceeded! Waiting 25s...")
+            time.sleep(25)
+            response = requests.post(url, headers=headers, json=payload, timeout=15)
+            if response.status_code == 429:
+                print("❌ Gemini 429 again! Skipping.")
+                return None
+                
         result = response.json()
         
         print("Gemini FULL RESPONSE:", result)
         
         if "error" in result:
             print("Gemini API Error:", result["error"])
-            return empty_result
+            return None
         
-        gemini_text = result["candidates"][0]["content"]["parts"][0]["text"]
-        print("Gemini Raw Response:", gemini_text)
+        raw_text = result["candidates"][0]["content"]["parts"][0]["text"]
+        print("Gemini Raw Response:", raw_text)
 
-        clean_output = clean_gemini_response(gemini_text)
-        
-        if clean_output is None:
-            return empty_result
+        # remove markdown
+        clean = raw_text.replace("```json", "").replace("```", "").strip()
+
+        if clean == "null":
+            gemini_output = None
+        else:
+            import json
+            gemini_output = json.loads(clean)
             
-        return clean_output
+        if gemini_output and gemini_output.get("confidence", 0) < 0.6:
+            gemini_output = None
+            
+        if gemini_output:
+            if gemini_output.get("text") == last_gemini_text:
+                print("Duplicate detected, skipping")
+                gemini_output = None
+            else:
+                last_gemini_text = gemini_output.get("text")
+            
+        print("FINAL GEMINI:", gemini_output)
+
+        return gemini_output
 
     except Exception as e:
         print("Gemini parsing error:", str(e))
-        return empty_result
+        return None
 
 def detect_language_label(text: str, base_lang_code: str) -> str:
     # Rule: If english characters exist alongside local indic fonts, label code-mixed
@@ -263,6 +313,47 @@ def apply_vad(input_path: str, output_path: str):
                 clean_audio += frame
                 
     clean_audio.export(output_path, format="wav")
+
+import threading
+import time
+
+text_buffer = []
+buffer_lock = threading.Lock()
+buffer_timer = None
+is_processing = False
+last_gemini_text = None
+
+def trigger_buffer_flush():
+    global text_buffer, buffer_timer, is_processing
+
+    if is_processing:
+        print("⏳ Timer fired but request is processing, skipping.")
+        return
+
+    with buffer_lock:
+        if not text_buffer:
+            return
+        combined_text = " ".join(text_buffer)
+        text_buffer.clear()
+    
+    print("⏳ Time-based fallback triggered (10s no chunks)")
+    print("Raw STT Batch (Timer):", combined_text)
+    
+    gemini_result = process_with_gemini(combined_text)
+    print("Gemini Output (Timer):", gemini_result)
+    
+    if gemini_result:
+        summary = generate_summary(gemini_result)
+        print("Generated Summary (Timer):", summary)
+        store_data(gemini_result, summary)
+
+def reset_buffer_timer():
+    global buffer_timer
+    if buffer_timer:
+        buffer_timer.cancel()
+    buffer_timer = threading.Timer(10.0, trigger_buffer_flush)
+    buffer_timer.daemon = True
+    buffer_timer.start()
 
 @app.get("/")
 def home():
@@ -311,6 +402,8 @@ async def upload_audio(file: UploadFile = File(...), timestamp: str = Form("Unkn
     
     print("Sending clean audio to Sarvam")
     # 3. Call Sarvam AI Speech-to-Text
+    global is_processing
+    is_processing = True
     headers = {
         "api-subscription-key": SARVAM_API_KEY, 
         "Authorization": f"Bearer {SARVAM_API_KEY}"
@@ -322,7 +415,6 @@ async def upload_audio(file: UploadFile = File(...), timestamp: str = Form("Unkn
                 "file": (filename, f, mime_type)
             }
             
-            # Send language_code parameter as instructed
             response = requests.post(
                 SARVAM_API_URL, 
                 headers=headers,
@@ -330,6 +422,10 @@ async def upload_audio(file: UploadFile = File(...), timestamp: str = Form("Unkn
                 data={"language_code": "unknown"}
             )
             
+            print("Sarvam Status:", response.status_code)
+            print("Sarvam Response:", response.text)
+            
+            is_processing = False
             response_json = response.json()
             
             if "error" in response_json:
@@ -340,19 +436,49 @@ async def upload_audio(file: UploadFile = File(...), timestamp: str = Form("Unkn
             text = response_json.get("transcript", "Could not parse text")
             raw_lang = response_json.get("language_code", "Unknown")
             
-            gemini_result = process_with_gemini(text)
+            should_flush = False
+            combined_text = ""
             
-            print("Sarvam Response:", response_json)
-            print("Raw STT:", text)
-            print("Gemini Output:", gemini_result)
-            
-            summary = generate_summary(gemini_result)
-            store_data(gemini_result, summary)
-            
-            return {
-                "data": gemini_result,
-                "summary": summary
-            }
+            if text and text.strip() and "Could not parse" not in text:
+                with buffer_lock:
+                    text_buffer.append(text)
+                    if len(text_buffer) >= 5:
+                        should_flush = True
+                        combined_text = " ".join(text_buffer)
+                        text_buffer.clear()
+                        if buffer_timer:
+                            buffer_timer.cancel()
+                    else:
+                        reset_buffer_timer()
+
+            if should_flush:
+                gemini_result = process_with_gemini(combined_text)
+                
+                print("Raw STT Batch:", combined_text)
+                print("Gemini Output:", gemini_result)
+                
+                if gemini_result is None:
+                    return {
+                        "data": None,
+                        "summary": None,
+                        "message": "No financial insight detected"
+                    }
+                
+                summary = generate_summary(gemini_result)
+                print("Generated Summary:", summary)
+                store_data(gemini_result, summary)
+                
+                return {
+                    "data": gemini_result,
+                    "summary": summary,
+                    "message": "success"
+                }
+            else:
+                return {
+                    "data": None,
+                    "summary": None,
+                    "message": "Buffered chunk"
+                }
             
     except Exception as e:
         print("Error processing audio:", str(e))

@@ -1,11 +1,42 @@
 import 'dart:convert';
 import 'dart:io';
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:record/record.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:http/http.dart' as http;
+
+Future<Map<String, dynamic>> sendToBackend(String filePath) async {
+  const backendUrl = 'http://10.0.3.49:8000/upload';
+  final file = File(filePath);
+  if (!file.existsSync() || file.lengthSync() == 0) {
+    return {"error": "File not found"};
+  }
+
+  try {
+    var uri = Uri.parse(backendUrl);
+    var request = http.MultipartRequest('POST', uri);
+    final timestampStr = DateTime.now().toLocal().toString().split('.')[0];
+    request.fields['timestamp'] = timestampStr;
+    request.files.add(await http.MultipartFile.fromPath('file', filePath));
+
+    var streamedResponse = await request.send().timeout(const Duration(seconds: 30));
+    var response = await http.Response.fromStream(streamedResponse);
+
+    print("Backend response: ${response.body}");
+    
+    if (response.statusCode == 200) {
+      return {"body": jsonDecode(response.body), "timestamp": timestampStr};
+    } else {
+      return {"error": "Processing error"};
+    }
+  } catch (e) {
+    print("Network Error: $e");
+    return {"error": "Network Error"};
+  }
+}
 
 void main() {
   runApp(const TalkTallyApp());
@@ -123,9 +154,11 @@ class _RecorderScreenState extends State<RecorderScreen> {
              await _startRecordingChunk(); 
              
              if (path != null) {
-               // Push chunk to background api sync silently
+               // Push chunk to background api sync safely without blocking UI
                _uploadAudioAndTranscribe(path);
              }
+             
+             await Future.delayed(const Duration(seconds: 2));
           });
         }
       }
@@ -143,77 +176,57 @@ class _RecorderScreenState extends State<RecorderScreen> {
   }
 
   Future<void> _uploadAudioAndTranscribe(String filePath) async {
-    // 1. URL for physical device over WiFi
-    const backendUrl = 'http://10.0.3.49:8000/upload';
+    await Future.delayed(const Duration(milliseconds: 10));
+    final result = await compute(sendToBackend, filePath);
+    
+    if (!mounted) return;
+    
+    if (result.containsKey("error")) {
+        setState(() {
+            _statusText = result["error"];
+            _isProcessing = false;
+        });
+        return;
+    }
+    
+    final responseData = result["body"];
+    final timestampStr = result["timestamp"];
+    
+    final data = responseData["data"];
+    final summary = responseData["summary"];
+    final message = responseData["message"];
 
-    // 2. Validate audio file
-    final file = File(filePath);
-    if (!await file.exists() || await file.length() == 0) {
-      if (!_isRecording) {
+    if (data == null) {
+      print("No financial insight");
+      if (mounted) {
           setState(() {
-            _statusText = "File not found";
+            _statusText = "Done: No Insight";
             _isProcessing = false;
           });
       }
       return;
     }
 
-    try {
-      print("Sending chunk to backend...");
-      var uri = Uri.parse(backendUrl);
-      var request = http.MultipartRequest('POST', uri);
-      
-      // 3. Attach standard fields
-      final timestampStr = DateTime.now().toLocal().toString().split('.')[0];
-      request.fields['timestamp'] = timestampStr;
-      request.files.add(await http.MultipartFile.fromPath('file', filePath));
+    String text = data["text"] ?? "";
+    double? amount;
+    if (data["amount"] != null) {
+        amount = (data["amount"] is int) ? (data["amount"] as int).toDouble() : data["amount"];
+    }
+    String? person = data["person"];
+    String? intent = data["intent"];
+    String? emotion = data["emotion"];
 
-      var streamedResponse = await request.send().timeout(const Duration(seconds: 30));
-      var response = await http.Response.fromStream(streamedResponse);
-
-      print("Response status: ${response.statusCode}");
-      
-      if (response.statusCode == 200) {
-        final Map<String, dynamic> responseData = json.decode(response.body);
+    if (mounted) {
+      setState(() {
+        _transcriptions.insert(0, {
+             "text": summary ?? "No insight", 
+             "language": "Parsed",
+             "timestamp": timestampStr,
+        });
         
-        setState(() {
-          // Push new transcription to top of list
-          _transcriptions.insert(0, {
-             "text": responseData['text'] ?? "Unable to parse text",
-             "language": responseData['language'] ?? "Unknown",
-             "timestamp": responseData['timestamp'] ?? timestampStr,
-          });
-          
-          if (!_isRecording) _statusText = "Done";
-        });
-      } else {
-        if (!_isRecording) {
-          setState(() {
-            _statusText = "Processing error";
-          });
-        }
-      }
-    } on TimeoutException {
-      if (!_isRecording) {
-        setState(() {
-            _statusText = "Network Error";
-        });
-      }
-    } catch (e) {
-      if (!_isRecording) {
-        setState(() {
-            _statusText = "Network Error";
-        });
-      }
-    } finally {
-      if (!_isRecording) {
-          setState(() {
-            _isProcessing = false;
-            if (_statusText != "Done" && _statusText != "Network Error" && _statusText != "Processing error" && _statusText != "File not found") {
-               _statusText = "Tap to start recording";
-            }
-          });
-      }
+        _statusText = "Done";
+        _isProcessing = false;
+      });
     }
   }
 
