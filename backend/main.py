@@ -50,6 +50,7 @@ try:
         amount FLOAT,
         currency TEXT,
         person TEXT,
+        product TEXT,
         intent TEXT,
         emotion TEXT,
         confidence FLOAT,
@@ -58,11 +59,12 @@ try:
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
-    # Add raw_json column to existing tables that may not have it
-    try:
-        cur.execute("ALTER TABLE financial_insights ADD COLUMN IF NOT EXISTS raw_json TEXT;")
-    except Exception:
-        pass
+    # Migrate existing tables
+    for col in ["raw_json TEXT", "product TEXT"]:
+        try:
+            cur.execute(f"ALTER TABLE financial_insights ADD COLUMN IF NOT EXISTS {col};")
+        except Exception:
+            pass
     conn.commit()
 except Exception as e:
     print("❌ Database connection error:", e)
@@ -131,6 +133,7 @@ def _extract_flat_fields(extraction):
         "amount": amount,
         "currency": "INR",
         "person": None,
+        "product": first.get("product"),
         "intent": first.get("intent"),
         "emotion": extraction.get("emotion"),
         "confidence": confidence,
@@ -148,13 +151,14 @@ def store_data(extraction, summary):
     try:
         cur.execute("""
             INSERT INTO financial_insights
-            (text, amount, currency, person, intent, emotion, confidence, summary, raw_json)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            (text, amount, currency, person, product, intent, emotion, confidence, summary, raw_json)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             flat.get("text"),
             flat.get("amount"),
             flat.get("currency"),
             flat.get("person"),
+            flat.get("product"),
             flat.get("intent"),
             flat.get("emotion"),
             flat.get("confidence"),
@@ -616,3 +620,271 @@ def get_insights():
     except Exception as e:
         print("Error fetching insights:", e)
         return {"insights": []}
+
+# ──────────────── ANALYTICS PIPELINE ────────────────
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+SQL_CHART_PROMPT = """
+You are a PostgreSQL query generator for a financial insights application.
+
+The database table is: financial_insights
+
+Columns:
+- id (serial)
+- product (text)  — values: SIP, FD, loan, EMI, insurance, mutual_fund, PPF, NPS, ELSS, credit_card, crypto, property, other
+- intent (text)   — values: START, STOP, INCREASE, DECREASE, PAY, DEFER, QUESTION
+- confidence (text) — values: DECIDED, CONSIDERING, MENTIONED
+- emotion (text)
+- amount (float)
+- summary (text)
+- created_at (timestamp)
+
+Your job: Generate FAST, OPTIMIZED SQL SELECT queries for visualization.
+
+RULES:
+- Only SELECT queries (no INSERT/UPDATE/DELETE)
+- Always GROUP BY when aggregating
+- Use COUNT(*) for frequency
+- Use ORDER BY count DESC
+- Use LIMIT if needed
+- Handle NULLs with COALESCE or WHERE ... IS NOT NULL
+
+TASKS:
+1. Product Distribution (Pie Chart) — count per product, exclude nulls
+2. Intent Distribution (Bar Chart) — count per intent, exclude nulls
+3. Confidence Distribution — count DECIDED/CONSIDERING/MENTIONED
+4. Timeline Trend — count events per day using DATE(created_at)
+5. Risk Proxy — count events where product IN ('loan','EMI','credit_card') as risk_count
+
+Return ONLY JSON (no explanation, no markdown):
+{
+  "queries": {
+    "product_distribution": "...",
+    "intent_distribution": "...",
+    "confidence_distribution": "...",
+    "timeline_trend": "...",
+    "risk_proxy": "..."
+  }
+}
+"""
+
+_cached_chart_queries = None
+
+FALLBACK_QUERIES = {
+    "product_distribution": "SELECT COALESCE(product, 'unknown') AS label, COUNT(*) AS count FROM financial_insights WHERE product IS NOT NULL GROUP BY product ORDER BY count DESC",
+    "intent_distribution": "SELECT COALESCE(intent, 'unknown') AS label, COUNT(*) AS count FROM financial_insights WHERE intent IS NOT NULL GROUP BY intent ORDER BY count DESC",
+    "confidence_distribution": "SELECT COALESCE(confidence::text, 'unknown') AS label, COUNT(*) AS count FROM financial_insights GROUP BY confidence ORDER BY count DESC",
+    "timeline_trend": "SELECT DATE(created_at) AS day, COUNT(*) AS count FROM financial_insights GROUP BY DATE(created_at) ORDER BY day ASC LIMIT 30",
+    "risk_proxy": "SELECT COUNT(*) AS risk_count FROM financial_insights WHERE product IN ('loan','EMI','credit_card')"
+}
+
+def generate_chart_queries_via_groq():
+    global _cached_chart_queries
+    if _cached_chart_queries:
+        return _cached_chart_queries
+
+    if not GROQ_API_KEY:
+        print("⚠️ GROQ_API_KEY not set, using fallback queries")
+        _cached_chart_queries = FALLBACK_QUERIES
+        return _cached_chart_queries
+
+    try:
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        payload = {
+            "model": "llama-3.3-70b-versatile",
+            "messages": [
+                {"role": "system", "content": SQL_CHART_PROMPT},
+                {"role": "user", "content": "Generate the 5 SQL queries as described."}
+            ],
+            "temperature": 0,
+            "max_tokens": 800
+        }
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers, json=payload, timeout=15
+        )
+        result = resp.json()
+        raw = result["choices"][0]["message"]["content"]
+        clean = re.sub(r"```json", "", raw)
+        clean = re.sub(r"```", "", clean).strip()
+        parsed = json.loads(clean)
+        _cached_chart_queries = parsed.get("queries", FALLBACK_QUERIES)
+        print("✅ Groq generated chart queries")
+        return _cached_chart_queries
+    except Exception as e:
+        print(f"❌ Groq query generation failed: {e}, using fallback")
+        _cached_chart_queries = FALLBACK_QUERIES
+        return _cached_chart_queries
+
+def run_query_safe(query):
+    """Execute a query and return rows as list of dicts."""
+    if cur is None:
+        return []
+    try:
+        cur.execute(query)
+        cols = [desc[0] for desc in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+    except Exception as e:
+        print(f"Query error: {e}")
+        conn.rollback()
+        return []
+
+@app.get("/analytics")
+def get_analytics():
+    """Return chart-ready data for Flutter analytics dashboard."""
+    if cur is None:
+        return {"error": "Database unavailable"}
+
+    queries = generate_chart_queries_via_groq()
+
+    return {
+        "product_distribution": run_query_safe(queries["product_distribution"]),
+        "intent_distribution":  run_query_safe(queries["intent_distribution"]),
+        "confidence_distribution": run_query_safe(queries["confidence_distribution"]),
+        "timeline_trend":       run_query_safe(queries["timeline_trend"]),
+        "risk_proxy":           run_query_safe(queries["risk_proxy"]),
+    }
+
+@app.post("/analytics/refresh")
+def refresh_chart_queries():
+    """Force-regenerate SQL queries from Groq (clears cache)."""
+    global _cached_chart_queries
+    _cached_chart_queries = None
+    queries = generate_chart_queries_via_groq()
+    return {"message": "Queries refreshed", "queries": queries}
+
+# ──────────────── GROQ INSIGHT GENERATOR ────────────────
+
+GROQ_INSIGHT_PROMPT = """
+You are a financial advisor AI for Indian users.
+
+You are given structured financial events extracted from conversations.
+Analyze the data and generate clear, practical insights.
+
+⚠️ RULES (VERY IMPORTANT):
+1. NO HALLUCINATION — Use ONLY the given data. Do NOT assume missing information.
+2. DECISION RULE — Generate action_items ONLY from events with confidence = DECIDED.
+   DO NOT give advice for CONSIDERING or MENTIONED events.
+3. RISK RULE — Only flag risks if clearly supported by data.
+   Examples: EMI/loan without savings → DEBT_STRESS risk; sudden investment increase → FOMO risk.
+4. KEEP IT SIMPLE — Easy for a normal user to understand. No technical jargon.
+
+──────────────── OUTPUT FORMAT ────────────────
+
+Return ONLY JSON (no markdown, no explanation):
+
+{
+  "insights": {
+    "summary": "1-2 line overall financial behavior",
+    "key_points": [
+      "Important observation 1",
+      "Important observation 2"
+    ],
+    "action_items": [
+      "Clear action based ONLY on DECIDED events"
+    ],
+    "risk_flags": [
+      "Only if real risk exists"
+    ]
+  }
+}
+
+If the events list is empty or contains no financial information, return:
+{"insights": {"summary": "No financial events to analyze.", "key_points": [], "action_items": [], "risk_flags": []}}
+"""
+
+def generate_groq_insights(events: list) -> dict:
+    """Send recent events to Groq and get user-friendly financial insights."""
+    if not GROQ_API_KEY:
+        return {
+            "insights": {
+                "summary": "Groq API key not configured.",
+                "key_points": [],
+                "action_items": [],
+                "risk_flags": []
+            }
+        }
+
+    try:
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        # Only send relevant fields to Groq — keep payload minimal
+        slim_events = [
+            {
+                "product": e.get("product"),
+                "intent": e.get("intent"),
+                "confidence": e.get("confidence"),
+                "emotion": e.get("emotion"),
+                "amount": e.get("amount"),
+                "time": e.get("time"),
+            }
+            for e in events if e.get("product") or e.get("intent")
+        ]
+
+        payload = {
+            "model": "llama-3.3-70b-versatile",
+            "messages": [
+                {"role": "system", "content": GROQ_INSIGHT_PROMPT},
+                {"role": "user", "content": json.dumps({"events": slim_events})}
+            ],
+            "temperature": 0.3,
+            "max_tokens": 600
+        }
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers, json=payload, timeout=20
+        )
+        result = resp.json()
+        raw = result["choices"][0]["message"]["content"]
+        clean = re.sub(r"```json", "", raw)
+        clean = re.sub(r"```", "", clean).strip()
+        return json.loads(clean)
+
+    except Exception as e:
+        print(f"❌ Groq insight generation failed: {e}")
+        return {
+            "insights": {
+                "summary": "Could not generate insights at this time.",
+                "key_points": [],
+                "action_items": [],
+                "risk_flags": []
+            }
+        }
+
+@app.get("/groq-insights")
+def get_groq_insights():
+    """Fetch recent DB events and run them through Groq for user-friendly insights."""
+    if cur is None:
+        return {"error": "Database unavailable"}
+
+    try:
+        cur.execute("""
+            SELECT product, intent, confidence, emotion, amount, summary, created_at
+            FROM financial_insights
+            WHERE product IS NOT NULL OR intent IS NOT NULL
+            ORDER BY created_at DESC
+            LIMIT 30
+        """)
+        rows = cur.fetchall()
+        events = [
+            {
+                "product":    row[0],
+                "intent":     row[1],
+                "confidence": row[2],
+                "emotion":    row[3],
+                "amount":     row[4],
+                "time":       str(row[6].date()) if row[6] else None,
+            }
+            for row in rows
+        ]
+    except Exception as e:
+        print(f"DB fetch error: {e}")
+        return {"error": "Failed to fetch events"}
+
+    return generate_groq_insights(events)

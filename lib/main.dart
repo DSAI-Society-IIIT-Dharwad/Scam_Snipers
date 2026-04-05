@@ -459,6 +459,13 @@ class _InsightsPageState extends State<InsightsPage> {
         elevation: 0,
         actions: [
           IconButton(
+            icon: const Icon(Icons.bar_chart),
+            tooltip: 'Analytics',
+            onPressed: () {
+              Navigator.push(context, MaterialPageRoute(builder: (_) => const AnalyticsPage()));
+            },
+          ),
+          IconButton(
             icon: const Icon(Icons.refresh),
             onPressed: _fetchInsights,
           )
@@ -542,6 +549,248 @@ class _InsightsPageState extends State<InsightsPage> {
                     },
                   ),
                 ),
+    );
+  }
+}
+
+// ─────────────────────────────────────────────────────
+//  ANALYTICS PAGE
+// ─────────────────────────────────────────────────────
+
+class AnalyticsPage extends StatefulWidget {
+  const AnalyticsPage({Key? key}) : super(key: key);
+  @override
+  State<AnalyticsPage> createState() => _AnalyticsPageState();
+}
+
+class _AnalyticsPageState extends State<AnalyticsPage> {
+  Map<String, dynamic>? _data;
+  Map<String, dynamic>? _groqInsights;
+  bool _isLoading = true;
+  String? _error;
+
+  static const String _baseUrl = 'http://10.0.3.49:8000';
+
+  @override
+  void initState() {
+    super.initState();
+    _fetchAll();
+  }
+
+  Future<void> _fetchAll() async {
+    setState(() { _isLoading = true; _error = null; });
+    try {
+      // Fetch charts + Groq insights in parallel
+      final results = await Future.wait([
+        http.get(Uri.parse('$_baseUrl/analytics')).timeout(const Duration(seconds: 20)),
+        http.get(Uri.parse('$_baseUrl/groq-insights')).timeout(const Duration(seconds: 25)),
+      ]);
+
+      final chartsResp = results[0];
+      final insightsResp = results[1];
+
+      setState(() {
+        if (chartsResp.statusCode == 200) _data = json.decode(chartsResp.body);
+        if (insightsResp.statusCode == 200) {
+          final body = json.decode(insightsResp.body);
+          _groqInsights = body['insights'] as Map<String, dynamic>?;
+        }
+        _isLoading = false;
+      });
+    } catch (e) {
+      setState(() { _error = 'Network error: $e'; _isLoading = false; });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF0F1117),
+      appBar: AppBar(
+        title: const Text('Analytics', style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white)),
+        backgroundColor: const Color(0xFF1A1D27),
+        iconTheme: const IconThemeData(color: Colors.white),
+        elevation: 0,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.refresh, color: Colors.white),
+            onPressed: _fetchAll,
+          )
+        ],
+      ),
+      body: _isLoading
+          ? const Center(child: CircularProgressIndicator(color: Color(0xFF6C63FF)))
+          : _error != null
+              ? Center(child: Text(_error!, style: const TextStyle(color: Colors.redAccent)))
+              : _buildDashboard(),
+    );
+  }
+
+  Widget _buildDashboard() {
+    if (_data == null) {
+      return const Center(child: Text('No data', style: TextStyle(color: Colors.white54)));
+    }
+    return ListView(
+      padding: const EdgeInsets.all(16),
+      children: [
+        _sectionHeader('📦 Product Distribution'),
+        _barChart(_data!['product_distribution']),
+        const SizedBox(height: 24),
+        _sectionHeader('🎯 Intent Distribution'),
+        _barChart(_data!['intent_distribution']),
+        const SizedBox(height: 24),
+        _sectionHeader('✅ Decision Confidence'),
+        _confidenceChart(_data!['confidence_distribution']),
+        const SizedBox(height: 24),
+        _sectionHeader('📅 Timeline Trend'),
+        _timelineChart(_data!['timeline_trend']),
+        const SizedBox(height: 24),
+        _riskBanner(_data!['risk_proxy']),
+        const SizedBox(height: 32),
+      ],
+    );
+  }
+
+  Widget _sectionHeader(String title) => Padding(
+    padding: const EdgeInsets.only(bottom: 12),
+    child: Text(title, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold, color: Colors.white)),
+  );
+
+  Widget _barChart(dynamic rows) {
+    if (rows == null || (rows as List).isEmpty) {
+      return const Text('No data yet', style: TextStyle(color: Colors.white38));
+    }
+    final items = rows as List;
+    final maxCount = items.map((r) => (r['count'] ?? 0) as num).reduce((a, b) => a > b ? a : b);
+    return Column(
+      children: items.map<Widget>((row) {
+        final label = row['label']?.toString() ?? '?';
+        final count = (row['count'] ?? 0) as num;
+        final ratio = maxCount > 0 ? count / maxCount : 0.0;
+        return Padding(
+          padding: const EdgeInsets.only(bottom: 10),
+          child: Row(
+            children: [
+              SizedBox(
+                width: 90,
+                child: Text(label, style: const TextStyle(color: Colors.white70, fontSize: 12), overflow: TextOverflow.ellipsis),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(4),
+                  child: LinearProgressIndicator(
+                    value: ratio.toDouble(),
+                    minHeight: 20,
+                    backgroundColor: const Color(0xFF2A2D3E),
+                    valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFF6C63FF)),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Text('$count', style: const TextStyle(color: Colors.white54, fontSize: 12)),
+            ],
+          ),
+        );
+      }).toList(),
+    );
+  }
+
+  static const _confColors = {
+    'DECIDED':     Color(0xFF4CAF50),
+    'CONSIDERING': Color(0xFFFFC107),
+    'MENTIONED':   Color(0xFF9E9E9E),
+  };
+
+  Widget _confidenceChart(dynamic rows) {
+    if (rows == null || (rows as List).isEmpty) {
+      return const Text('No data yet', style: TextStyle(color: Colors.white38));
+    }
+    final items = rows as List;
+    final total = items.map((r) => (r['count'] ?? 0) as num).fold<num>(0, (a, b) => a + b);
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+      children: items.map<Widget>((row) {
+        final label = row['label']?.toString() ?? '?';
+        final count = (row['count'] ?? 0) as num;
+        final pct = total > 0 ? (count / total * 100).toStringAsFixed(0) : '0';
+        final color = _confColors[label] ?? Colors.blueGrey;
+        return Column(
+          children: [
+            Container(
+              width: 64, height: 64,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                border: Border.all(color: color, width: 3),
+              ),
+              child: Center(child: Text('$pct%', style: TextStyle(color: color, fontWeight: FontWeight.bold))),
+            ),
+            const SizedBox(height: 6),
+            Text(label, style: const TextStyle(color: Colors.white60, fontSize: 11)),
+            Text('($count)', style: const TextStyle(color: Colors.white38, fontSize: 11)),
+          ],
+        );
+      }).toList(),
+    );
+  }
+
+  Widget _timelineChart(dynamic rows) {
+    if (rows == null || (rows as List).isEmpty) {
+      return const Text('No data yet', style: TextStyle(color: Colors.white38));
+    }
+    final items = rows as List;
+    final maxCount = items.map((r) => (r['count'] ?? 0) as num).reduce((a, b) => a > b ? a : b);
+    return SizedBox(
+      height: 80,
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: items.map<Widget>((row) {
+          final count = (row['count'] ?? 0) as num;
+          final ratio = maxCount > 0 ? count / maxCount : 0.0;
+          final day = row['day']?.toString().split('T')[0] ?? '';
+          return Expanded(
+            child: Tooltip(
+              message: '$day: $count',
+              child: Container(
+                margin: const EdgeInsets.symmetric(horizontal: 2),
+                height: (60 * ratio + 4).toDouble(),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF6C63FF).withOpacity(0.75),
+                  borderRadius: BorderRadius.circular(3),
+                ),
+              ),
+            ),
+          );
+        }).toList(),
+      ),
+    );
+  }
+
+  Widget _riskBanner(dynamic rows) {
+    if (rows == null || (rows as List).isEmpty) return const SizedBox();
+    final riskCount = (rows[0]['risk_count'] ?? 0) as num;
+    final color = riskCount > 5 ? Colors.redAccent : riskCount > 1 ? Colors.orangeAccent : Colors.greenAccent;
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.1),
+        border: Border.all(color: color.withOpacity(0.4)),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.warning_amber_rounded, color: color, size: 32),
+          const SizedBox(width: 12),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('⚠️ Risk Events', style: TextStyle(color: color, fontWeight: FontWeight.bold, fontSize: 15)),
+              Text('$riskCount loan/EMI/credit events found',
+                  style: const TextStyle(color: Colors.white54, fontSize: 12)),
+            ],
+          ),
+        ],
+      ),
     );
   }
 }
