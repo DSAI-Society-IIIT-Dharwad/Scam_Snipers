@@ -36,7 +36,7 @@ try:
     conn = psycopg2.connect(
         dbname="finance_db",
         user="postgres",
-        password="postgres123",   # replace if different
+        password="postgres123",
         host="localhost",
         port="5433"
     )
@@ -54,67 +54,115 @@ try:
         emotion TEXT,
         confidence FLOAT,
         summary TEXT,
+        raw_json TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     """)
+    # Add raw_json column to existing tables that may not have it
+    try:
+        cur.execute("ALTER TABLE financial_insights ADD COLUMN IF NOT EXISTS raw_json TEXT;")
+    except Exception:
+        pass
     conn.commit()
 except Exception as e:
     print("❌ Database connection error:", e)
     conn = None
     cur = None
 
-def generate_summary(data):
-    if not data or data.get("text") is None:
+def generate_summary(extraction):
+    """Build a human-readable summary from the new flat events schema."""
+    if not extraction:
         return None
 
-    amount = data.get("amount")
-    person = data.get("person")
-    intent = data.get("intent")
-    emotion = data.get("emotion")
+    # Use the pre-built summary from insights if available
+    insights = extraction.get("insights", {})
+    summary = insights.get("summary", "")
+    if summary:
+        return summary
 
+    # Fallback: build from events
+    events = extraction.get("events", [])
     parts = []
+    for ev in events:
+        conf = ev.get("confidence", "")
+        product = ev.get("product", "")
+        intent = ev.get("intent", "")
+        amt = ev.get("amount") or {}
+        target = amt.get("target") or amt.get("current")
+        t = ev.get("time", "")
+        line = f"[{conf}] {intent} {product}"
+        if target:
+            line += f" ₹{target}"
+        if t:
+            line += f" ({t})"
+        parts.append(line)
 
-    if intent == "transfer":
-        parts.append(f"Transfer ₹{amount} to {person}")
-    elif intent == "investment":
-        parts.append(f"Investment of ₹{amount}")
-    elif intent == "loan":
-        parts.append(f"Loan discussion of ₹{amount}")
-    else:
-        parts.append("Financial activity detected")
+    emotion = extraction.get("emotion", "")
+    if emotion:
+        parts.append(f"Emotion: {emotion}")
 
-    if emotion == "stress":
-        parts.append("user is stressed")
-    elif emotion == "positive":
-        parts.append("user feels confident")
-    else:
-        parts.append("neutral sentiment")
+    risk_flags = insights.get("risk_flags", [])
+    if risk_flags:
+        parts.append("Risks: " + ", ".join(risk_flags))
 
-    return ", ".join(parts)
+    return " | ".join(parts) if parts else None
 
-def store_data(data, summary):
+def _extract_flat_fields(extraction):
+    """Extract flat DB-compatible fields from the new flat events schema."""
+    if not extraction:
+        return {}
+
+    events = extraction.get("events", [])
+    first = events[0] if events else {}
+    amt = first.get("amount") or {}
+
+    amount = amt.get("target") or amt.get("current")
+    conf_str = first.get("confidence", "MENTIONED")
+    confidence = {"DECIDED": 1.0, "CONSIDERING": 0.7, "MENTIONED": 0.5}.get(conf_str, 0.5)
+
+    risk = first.get("risk")
+    risk_str = risk.get("type") if risk else None
+
+    insights = extraction.get("insights", {})
+    text = insights.get("summary") or (first.get("raw_text") if first else None)
+
+    return {
+        "text": text,
+        "amount": amount,
+        "currency": "INR",
+        "person": None,
+        "intent": first.get("intent"),
+        "emotion": extraction.get("emotion"),
+        "confidence": confidence,
+    }
+
+def store_data(extraction, summary):
     if cur is None:
         print("⚠️ DB not connected, skipping insert")
         return
+    if not extraction:
+        return
+
+    flat = _extract_flat_fields(extraction)
 
     try:
         cur.execute("""
-            INSERT INTO financial_insights 
-            (text, amount, currency, person, intent, emotion, confidence, summary)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO financial_insights
+            (text, amount, currency, person, intent, emotion, confidence, summary, raw_json)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
-            data.get("text"),
-            data.get("amount"),
-            data.get("currency"),
-            data.get("person"),
-            data.get("intent"),
-            data.get("emotion"),
-            data.get("confidence"),
-            summary
+            flat.get("text"),
+            flat.get("amount"),
+            flat.get("currency"),
+            flat.get("person"),
+            flat.get("intent"),
+            flat.get("emotion"),
+            flat.get("confidence"),
+            summary,
+            json.dumps(extraction)
         ))
         conn.commit()
         print("✅ Data stored in PostgreSQL")
-
     except Exception as e:
         print("❌ Insert error:", e)
 
@@ -123,39 +171,120 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY not found. Please set it in environment variables.")
 
-conversation_buffer = []
+GEMINI_EXTRACTION_SYSTEM_PROMPT = """
+You are a STRICT financial event extractor and insight generator for Indian users.
 
-def build_context(new_text):
-    global conversation_buffer
+Input may be multilingual (English, Hindi, Hinglish, Tamil, Telugu, etc.).
+Your job is to extract CLEAN, DATABASE-READY financial events and generate minimal, accurate insights.
 
-    if new_text:
-        conversation_buffer.append(new_text)
+⚠️ OUTPUT RULES (MANDATORY)
+* Return ONLY valid JSON
+* No markdown, no explanation, no extra text
+* Follow schema EXACTLY
+* Do NOT add extra fields
+* Do NOT change field names
 
-    # Keep only last 3 chunks
-    if len(conversation_buffer) > 3:
-        conversation_buffer.pop(0)
+──────────────── ENTITY TYPES ────────────────
 
-    # Combine into context
-    context = " ".join(conversation_buffer)
-    return context
+FIN_PRODUCT:
+Allowed values ONLY:
+SIP | FD | loan | EMI | insurance | mutual_fund |
+PPF | NPS | ELSS | credit_card | crypto | property | other
 
-def clean_gemini_response(text):
-    if not text:
+FIN_INTENT:
+START | STOP | INCREASE | DECREASE | PAY | DEFER | QUESTION
+
+CONFIDENCE:
+DECIDED     → clear action taken
+CONSIDERING → thinking or asking
+MENTIONED   → just discussion
+
+FIN_AMOUNT:
+* value must ALWAYS be a number (no ₹ symbol, no strings)
+* currency ALWAYS "INR"
+* unit: absolute | percent | vague
+If 2 amounts exist:
+  assign lower  → current
+  assign higher → target
+  compute delta  = target - current
+If no amount clearly mentioned → set all amount fields to null
+
+FIN_TIME:
+Normalize to short English only:
+"\u0906\u091c"          → "today"
+"kal"          → "tomorrow"
+"agle mahine"  → "next month"
+"3 saal"       → "3 years"
+If unclear → null
+
+FIN_RISK:
+Allowed values ONLY:
+OVER_LEVERAGE | DEBT_STRESS | FOMO | IMPULSE | UNVERIFIED_TIP
+Severity: HIGH | MEDIUM | LOW
+If no clear risk → set risk = null
+
+──────────────── EVENT RULES ────────────────
+
+Each event MUST include: product, intent, confidence
+Optional: amount, time, risk
+Each event represents ONE financial action or discussion.
+
+──────────────── STRICT SAFETY RULES ────────────────
+
+1. NO HALLUCINATION: If not explicitly present → return null. DO NOT assume, infer, or guess.
+2. STRICT ENUM: Only use allowed values for product, intent, risk.
+3. STRICT NUMERIC: Amounts must be numbers only. No ₹ or symbols. No strings.
+4. STRICT NULL: If any field is missing → use null. No empty strings.
+5. STRICT INSIGHT: Insights only from DECIDED events. No actions for CONSIDERING/MENTIONED.
+
+──────────────── OUTPUT FORMAT (STRICT) ────────────────
+
+{
+  "events": [
+    {
+      "event_id": "E1",
+      "product": "SIP",
+      "intent": "INCREASE",
+      "confidence": "DECIDED",
+      "amount": {
+        "current": 5000,
+        "target": 8000,
+        "delta": 3000,
+        "unit": "absolute"
+      },
+      "time": "next month",
+      "risk": {
+        "type": "FOMO",
+        "severity": "MEDIUM"
+      },
+      "raw_text": "SIP badha dete hain 5000 se 8000 next month"
+    }
+  ],
+  "insights": {
+    "decisions": [],
+    "action_items": [],
+    "risk_flags": [],
+    "summary": ""
+  },
+  "emotion": "neutral",
+  "language_detected": "hinglish"
+}
+
+If there is NO financial content at all, return exactly: null
+"""
+
+def clean_llm_response(raw):
+    """Strip markdown fences and parse JSON. Returns None if null/invalid."""
+    if not raw:
         return None
-
-    text = text.strip()
-
-    # Remove markdown wrappers
-    text = re.sub(r"```json", "", text)
-    text = re.sub(r"```", "", text)
-    text = text.strip()
-
-    # Handle null safely
-    if text.lower() == "null":
+    clean = raw.strip()
+    clean = re.sub(r"```json", "", clean)
+    clean = re.sub(r"```", "", clean)
+    clean = clean.strip()
+    if clean.lower() == "null":
         return None
-
     try:
-        return json.loads(text)
+        return json.loads(clean)
     except Exception as e:
         print("JSON parsing error:", e)
         return None
@@ -170,8 +299,8 @@ def process_with_gemini(text: str):
         # English
         "money", "rupees", "₹", "loan", "emi", "pay", "transfer", "send",
         "investment", "mutual fund", "expense", "salary", "debt", "bill",
-        "budget", "saving", "saving", "bank", "interest", "finance", "cost",
-        "afford", "expensive", "cheap", "price", "fee", "tax", "income",
+        "budget", "saving", "bank", "interest", "finance", "cost",
+        "afford", "expensive", "price", "fee", "tax", "income", "sip",
         "spend", "spent", "lend", "borrow", "credit", "debit", "due",
         # Hindi / Indic
         "ईएएमआई", "ईएमआई", "पैसा", "पैसे", "रुपए", "लोन",
@@ -181,106 +310,64 @@ def process_with_gemini(text: str):
 
     if not any(word in text.lower() for word in financial_keywords):
         return None
-        
-    headers = {
-        "Content-Type": "application/json"
-    }
-    
-    prompt = f"""
-Extract financial information from the speech.
 
-IMPORTANT:
-- Keep meaning EXACT
-- Do NOT add new information
-- Do NOT rephrase heavily
-- Only clean and normalize
+    headers = {"Content-Type": "application/json"}
 
-If financial signal exists:
-- Convert to simple English
-- Extract amount (number only if present)
-- Extract person (if mentioned)
-- Classify intent (transfer, loan, expense, investment, discussion)
-- Detect emotion (stress, neutral, positive)
-
-If no financial content:
-return null
-
-Return JSON ONLY (no markdown, no explanation):
-
-{{
-  "text": "...",
-  "amount": number or null,
-  "currency": "INR",
-  "person": "... or null",
-  "intent": "...",
-  "emotion": "...",
-  "confidence": 0-1
-}}
-
-Speech:
-{text}
-"""
-    
     payload = {
+        "system_instruction": {
+            "parts": [{"text": GEMINI_EXTRACTION_SYSTEM_PROMPT}]
+        },
         "contents": [
             {
-                "parts": [
-                    {"text": prompt}
-                ]
+                "role": "user",
+                "parts": [{"text": f"Transcript:\n{text}"}]
             }
         ]
     }
-    
+
     try:
-        url = f"https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
-        response = requests.post(url, headers=headers, json=payload, timeout=15)
-        
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+        response = requests.post(url, headers=headers, json=payload, timeout=20)
+
         if response.status_code == 429:
-            import time
             print("⚠️ Gemini 429 Quota Exceeded! Waiting 25s...")
             time.sleep(25)
-            response = requests.post(url, headers=headers, json=payload, timeout=15)
+            response = requests.post(url, headers=headers, json=payload, timeout=20)
             if response.status_code == 429:
                 print("❌ Gemini 429 again! Skipping.")
                 return None
-                
+
         result = response.json()
-        
         print("Gemini FULL RESPONSE:", result)
-        
+
         if "error" in result:
             print("Gemini API Error:", result["error"])
             return None
-        
+
         raw_text = result["candidates"][0]["content"]["parts"][0]["text"]
         print("Gemini Raw Response:", raw_text)
 
-        # remove markdown
-        clean = raw_text.replace("```json", "").replace("```", "").strip()
+        extraction = clean_llm_response(raw_text)
 
-        if clean == "null":
-            gemini_output = None
-        else:
-            import json
-            gemini_output = json.loads(clean)
-            
-        if gemini_output and gemini_output.get("confidence", 0) < 0.6:
-            gemini_output = None
-            
-        if gemini_output:
-            if gemini_output.get("text") == last_gemini_text:
-                print("Duplicate detected, skipping")
-                gemini_output = None
-            else:
-                last_gemini_text = gemini_output.get("text")
-            
-        print("FINAL GEMINI:", gemini_output)
+        if extraction is None:
+            return None
 
-        return gemini_output
+        # Duplicate check on insights summary
+        insights = extraction.get("insights", {})
+        first_summary = insights.get("summary") or (extraction.get("events", [{}])[0].get("raw_text"))
+
+        if first_summary and first_summary == last_gemini_text:
+            print("Duplicate detected, skipping")
+            return None
+
+        last_gemini_text = first_summary
+        print("FINAL EXTRACTION:", extraction)
+        return extraction
 
     except Exception as e:
         print("Gemini parsing error:", str(e))
         return None
+
 
 def detect_language_label(text: str, base_lang_code: str) -> str:
     # Rule: If english characters exist alongside local indic fonts, label code-mixed
